@@ -4,11 +4,9 @@ import (
 	"log"
 	"os"
 
-	"github.com/Artur-Galstyan/workcraft-stronghold/database"
-	"github.com/Artur-Galstyan/workcraft-stronghold/events"
 	"github.com/Artur-Galstyan/workcraft-stronghold/stronghold"
 	"github.com/joho/godotenv"
-	_ "github.com/mattn/go-sqlite3"
+	"github.com/redis/go-redis/v9"
 )
 
 var apiKey string
@@ -33,9 +31,13 @@ func init() {
 func main() {
 	log.Printf("Version: %s, Build Date: %s, Commit: %s\n", Version, BuildDate, CommitHash)
 
-	database.InitDB()
-	eventSender := events.NewEventSender()
-
-	stronhold := stronghold.NewStronghold(apiKey, database.DB, eventSender)
+	client := redis.NewClient(&redis.Options{
+		Addr:     "localhost:6379",
+		Password: "",
+		DB:       0,
+		Protocol: 2,
+	})
+	stronhold := stronghold.NewStronghold(apiKey, client)
 	stronhold.Run()
+
 }

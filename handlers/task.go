@@ -1,22 +1,21 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net/http"
+	"time"
 
-	"github.com/Artur-Galstyan/workcraft-stronghold/errs"
-	"github.com/Artur-Galstyan/workcraft-stronghold/events"
 	"github.com/Artur-Galstyan/workcraft-stronghold/models"
-	"github.com/Artur-Galstyan/workcraft-stronghold/sqls"
 	"github.com/Artur-Galstyan/workcraft-stronghold/utils"
 	"github.com/Artur-Galstyan/workcraft-stronghold/views"
 	"github.com/a-h/templ"
-	"gorm.io/gorm"
+	"github.com/redis/go-redis/v9"
 )
 
-func CreateTaskViewHandler(db *gorm.DB) http.HandlerFunc {
+func CreateTaskViewHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		taskID := r.PathValue("id")
 		if taskID == "" {
@@ -24,14 +23,7 @@ func CreateTaskViewHandler(db *gorm.DB) http.HandlerFunc {
 			http.Error(w, "Task ID is required", http.StatusBadRequest)
 			return
 		}
-
-		task, err := sqls.GetTask(db, taskID)
-		if err != nil {
-			slog.Error("Error querying task", "err", err)
-			http.Error(w, "Unable to find task", http.StatusNotFound)
-			return
-		}
-
+		task := models.Task{}
 		component := views.Task(task)
 		templ.Handler(component).ServeHTTP(w, r)
 	}
@@ -42,7 +34,7 @@ func TaskView(w http.ResponseWriter, r *http.Request) {
 	templ.Handler(component).ServeHTTP(w, r)
 }
 
-func CreateTaskUpdateHandler(db *gorm.DB, eventSender *events.EventSender) http.HandlerFunc {
+func CreateTaskUpdateHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("POST /api/task/{id}/update")
 		taskID := r.PathValue("id")
@@ -87,35 +79,11 @@ func CreateTaskUpdateHandler(db *gorm.DB, eventSender *events.EventSender) http.
 		_, update.RetryLimitSet = rawJSON["retry_limit"]
 		_, update.LogsSet = rawJSON["logs"]
 
-		updatedTask, err := sqls.UpdateTask(db, taskID, update)
-		if err != nil {
-			status, msg := errs.Get(err)
-			slog.Error("Failed to update task", "err", err)
-			http.Error(w, msg, status)
-			return
-		}
-
-		taskJSON, err := json.Marshal(updatedTask)
-		if err != nil {
-			slog.Error("Failed to serialize updated task", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
-		msg := fmt.Sprintf(`{"type": "task_update", "message": {"task": %s}}`,
-			string(taskJSON))
-		eventSender.BroadcastToChieftains(msg)
-
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(updatedTask); err != nil {
-			slog.Error("Failed to encode response", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
 	}
 }
 
-func CreatePostTaskHandler(db *gorm.DB) http.HandlerFunc {
+func CreatePostTaskHandler(client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("Received new task!")
 
@@ -126,24 +94,49 @@ func CreatePostTaskHandler(db *gorm.DB) http.HandlerFunc {
 			return
 		}
 
-		task, err := sqls.CreateTask(db, task)
-		if err != nil {
-			slog.Error("Failed to create task", "err", err)
+		task.Status = models.TaskStatusPending
+
+		payloadJSON, _ := json.Marshal(task.Payload)
+		resultJSON, _ := json.Marshal(task.Result)
+
+		taskDataForHash := map[string]interface{}{
+			"id":               task.ID,
+			"created_at":       task.CreatedAt.Format(time.RFC3339),
+			"updated_at":       task.UpdatedAt.Format(time.RFC3339),
+			"task_name":        task.TaskName,
+			"status":           string(task.Status),
+			"queue":            task.Queue,
+			"retry_on_failure": task.RetryOnFailure,
+			"payload":          string(payloadJSON),
+			"result":           string(resultJSON),
+		}
+
+		ctx := context.Background()
+		taskKey := "task:" + task.ID
+
+		pipe := client.TxPipeline()
+		pipe.HSet(ctx, taskKey, taskDataForHash)
+		pipe.SAdd(ctx, "tasks:status:"+string(task.Status), task.ID)
+		pipe.SAdd(ctx, "tasks:task_name:"+task.TaskName, task.ID)
+		pipe.SAdd(ctx, "tasks:queue:"+task.Queue, task.ID)
+
+		if _, err := pipe.Exec(ctx); err != nil {
+			slog.Error("Failed to execute transaction to store task", "err", err)
 			http.Error(w, "Failed to create task", http.StatusInternalServerError)
 			return
 		}
 
+		fullTaskJSON, _ := json.Marshal(task)
+		client.LPush(ctx, task.Queue, fullTaskJSON)
+
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusCreated)
-		if err := json.NewEncoder(w).Encode(task); err != nil {
-			slog.Error("Failed to encode task", "err", err)
-		}
+		json.NewEncoder(w).Encode(task)
 	}
 }
 
-func CreateGetTasksHandler(db *gorm.DB) http.HandlerFunc {
+func CreateGetTasksHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		// slog.Info("GET /api/tasks")
 		queryString := r.URL.Query().Get("query")
 
 		queryParams, err := utils.ParseTaskQuery(queryString)
@@ -151,23 +144,13 @@ func CreateGetTasksHandler(db *gorm.DB) http.HandlerFunc {
 			http.Error(w, fmt.Sprintf("Invalid query: %v", err), http.StatusBadRequest)
 			return
 		}
-
-		response, err := sqls.GetTasks(db, *queryParams)
-		if err != nil {
-			slog.Error("Failed to fetch tasks", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+		fmt.Println(queryParams)
 
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(response); err != nil {
-			slog.Error("Error encoding response", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
 	}
 }
 
-func CreateGetTaskHandler(db *gorm.DB) http.HandlerFunc {
+func CreateGetTaskHandler() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("GET /api/task/{id}")
 
@@ -179,23 +162,11 @@ func CreateGetTaskHandler(db *gorm.DB) http.HandlerFunc {
 		}
 
 		slog.Info("Fetching task", "id", taskID)
-
-		task, err := sqls.GetTask(db, taskID)
-		if err != nil {
-			slog.Error("Failed to fetch task", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
-
 		w.Header().Set("Content-Type", "application/json")
-		if err := json.NewEncoder(w).Encode(task); err != nil {
-			slog.Error("Failed to encode task", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-		}
 	}
 }
 
-func CreateCancelTaskHandler(db *gorm.DB, eventSender *events.EventSender) http.HandlerFunc {
+func CreateCancelTaskHandler(client *redis.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		slog.Info("POST /api/task/{id}/cancel")
 
@@ -207,22 +178,16 @@ func CreateCancelTaskHandler(db *gorm.DB, eventSender *events.EventSender) http.
 		}
 		slog.Info("Received cancel for task", "id", taskID)
 
-		task, err := sqls.GetTask(db, taskID)
-		if err != nil {
-			slog.Error("Failed to fetch task", "err", err)
-			http.Error(w, "Internal server error", http.StatusInternalServerError)
-			return
-		}
+		ctx := context.Background()
 
-		msg := fmt.Sprintf(`{"type": "cancel_task", "data": "%s"}`, taskID)
-		if err := eventSender.SendEvent(*task.PeonID, msg); err != nil {
-			slog.Error("Failed to send cancel message", "err", err)
+		if err := client.Publish(ctx, "cancel", taskID).Err(); err != nil {
+			slog.Error("Failed to publish cancellation message", "err", err)
 			http.Error(w, "Internal server error", http.StatusInternalServerError)
 			return
 		}
 
 		res := map[string]interface{}{
-			"send": "true",
+			"cancellation_sent": "true",
 		}
 
 		w.Header().Set("Content-Type", "application/json")
